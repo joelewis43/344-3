@@ -10,3 +10,7 @@ smallsh.c
    - cd
    - exit
    - status
+
+ - Additional Functionality
+   - Redirects input and output like a BASH shell
+   - expands $$ inside of any command/argument into shell's PID
