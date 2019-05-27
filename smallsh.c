@@ -3,12 +3,17 @@
 #include    <unistd.h>
 #include    <stdlib.h>
 #include    <fcntl.h>
+#include    <signal.h>
 
 #define     MAXBUFFER       2048
 #define     MAXARGS         512
 #define     ARGLENGTH       128
 #define     MAXCHILDREN     16
 
+
+
+/***************** GLOBAL VARIABLES **************/
+int BACKGROUND_ENABLED = 1;
 
 /***************** PRE EXECUTION *****************/
 void tryWaiting(int backgroundChildren[MAXCHILDREN]);
@@ -20,7 +25,12 @@ int isComment(char *command);
 
 
 /***************** EXECUTION *********************/
-void execute(char commands[MAXARGS][ARGLENGTH], int backgroundChildren[MAXCHILDREN], int statusInfo[2]);
+void execute(
+    char commands[MAXARGS][ARGLENGTH],
+    int backgroundChildren[MAXCHILDREN],
+    int statusInfo[2],
+    struct sigaction *SIGINT_action
+);
 
 
 /***************** BUILT IN **********************/
@@ -28,11 +38,21 @@ int isBuiltIn(char *array);
 void builtInExit(int backgroundChildren[MAXCHILDREN]);
 void builtInCD(char *path);
 void builtInStatus(int statusInfo[2]);
-void runBuiltIn(char commands[MAXARGS][ARGLENGTH], int ID, int backgroundChildren[MAXCHILDREN], int statusInfo[2]);
+void runBuiltIn(
+    char commands[MAXARGS][ARGLENGTH],
+    int ID,
+    int backgroundChildren[MAXCHILDREN],
+    int statusInfo[2]
+);
 
 
 /***************** NON BUILT IN ******************/
-void runCommannd(char commands[MAXARGS][ARGLENGTH], int backgroundChildren[MAXCHILDREN], int statusInfo[2]);
+void runCommannd(
+    char commands[MAXARGS][ARGLENGTH],
+    int backgroundChildren[MAXCHILDREN],
+    int statusInfo[2],
+    struct sigaction *SIGINT_action
+);
 int isBackground(char commands[MAXARGS][ARGLENGTH]);
 
 
@@ -47,13 +67,25 @@ void redirectOutput(char *outputFile, int backgroundFlag);
 void childProcess(char commands[MAXARGS][ARGLENGTH]);
 char ** buildExecArgs(char commands[MAXARGS][ARGLENGTH]);
 void copyExecArgs(char commands[MAXARGS][ARGLENGTH], char **temp);
-void expandPID(char* currentCommand, char* destination);
+void expandPID(char* currentCommand, int pid);
 void freeExecArgs(char ** nullCommands);
 
 
 /***************** NON BUILT IN (PARENT) *********/
 void addToBackground(int childPID, int backgroundChildren[MAXCHILDREN]);
 void collectData(int exitMethod, int statusInfo[2]);
+
+
+
+
+/***************** SIGNALS ***********************/
+void killSIGINT();
+void ignoreSIGINT(struct sigaction *SIGINT_action);
+void processSIGINT(struct sigaction *SIGINT_action);
+void assignChildSignal(struct sigaction *SIGINT_action, int backgroundFlag);
+void processSIGTSTP();
+void ignoreSIGTSTP(struct sigaction *SIGTSTP_action);
+
 
 
 
@@ -66,6 +98,12 @@ int main() {
     char commandArray[MAXARGS][ARGLENGTH];          // array for breaking up commands
     int backgroundChildren[MAXCHILDREN] = { 0 };    // array for tracking background processes
     int statusInfo[2] = { 0 };                      // array to hold exit status information
+
+    /* Signal Setup */
+    struct sigaction SIGINT_action = {0};           // action struct for SIGINT
+    ignoreSIGINT(&SIGINT_action);                   // set parent to IGNORE SIGINT
+    struct sigaction SIGTSTP_action = {0};           // action struct for SIGTSTP
+    ignoreSIGTSTP(&SIGTSTP_action);                   // set parent to IGNORE SIGTSTP
 
     while (1) {
 
@@ -82,7 +120,7 @@ int main() {
         split(commandBuffer, commandArray);
 
         // run the given command
-        execute(commandArray, backgroundChildren, statusInfo);
+        execute(commandArray, backgroundChildren, statusInfo, &SIGINT_action);
     }
     return 0;
 }
@@ -175,7 +213,7 @@ void split(char *buffer, char array[MAXARGS][ARGLENGTH]) {
 int isComment(char *command) {
 
     // compare the commmand to the comment character
-    if (strcmp(command, "#") == 0) {
+    if (strstr(command, "#")) {
         return 1;
     }
     return 0;
@@ -185,7 +223,7 @@ int isComment(char *command) {
 
 
 /***************** EXECUTION *********************/
-void execute(char commands[MAXARGS][ARGLENGTH], int backgroundChildren[MAXCHILDREN], int statusInfo[2]) {
+void execute(char commands[MAXARGS][ARGLENGTH], int backgroundChildren[MAXCHILDREN], int statusInfo[2], struct sigaction *SIGINT_action) {
 
     int builtInID;
 
@@ -201,7 +239,7 @@ void execute(char commands[MAXARGS][ARGLENGTH], int backgroundChildren[MAXCHILDR
 
     // run other commands
     else {
-        runCommannd(commands, backgroundChildren, statusInfo);
+        runCommannd(commands, backgroundChildren, statusInfo, SIGINT_action);
     }
 }
 
@@ -290,6 +328,10 @@ void builtInCD(char *path) {
         strcpy(path, "");
     }
 
+    if (strstr(path, "$$")) {
+        expandPID(path, getpid());
+    }
+
     if (strcmp(path, "") == 0) {
         flag = chdir(getenv("HOME"));
     }
@@ -315,7 +357,7 @@ void builtInStatus(int statusInfo[2]) {
         printf("exit value %d\n", statusInfo[1]);
     }
     else {
-        printf("terminating by signal %d\n", statusInfo[1]);
+        printf("terminated by signal %d\n", statusInfo[1]);
     }
 
     fflush(stdout);
@@ -327,18 +369,22 @@ void builtInStatus(int statusInfo[2]) {
 
 
 /***************** NON BUILT IN ******************/
-void runCommannd(char commands[MAXARGS][ARGLENGTH], int backgroundChildren[MAXCHILDREN], int statusInfo[2]) {
+void runCommannd(char commands[MAXARGS][ARGLENGTH], int backgroundChildren[MAXCHILDREN], int statusInfo[2], struct sigaction *SIGINT_action) {
 
     /* Variable Declaration */
     int exitMethod;                 // stores info about how the child exited
     int currentChildPID;            // stores PID of forked child
-    int backgroundFlag;             // 1 if a background command, other 0
+    int backgroundFlag = 0;         // 1 if a background command, other 0
 
     // create a fork for the non-built in command
     currentChildPID = fork();
 
-    // check if the command is a background command
-    backgroundFlag = isBackground(commands);
+    // if the flag is set (& is enabled)
+    if (BACKGROUND_ENABLED) {
+
+        // check for background command
+        backgroundFlag = isBackground(commands);
+    }
 
     // differentiate between child and parent
     switch(currentChildPID) {
@@ -353,6 +399,9 @@ void runCommannd(char commands[MAXARGS][ARGLENGTH], int backgroundChildren[MAXCH
 
             // perform appropriate IO redirection
             ioRedirect(commands, backgroundFlag);
+
+            // assign childs SIGINT handler
+            assignChildSignal(SIGINT_action, backgroundFlag);
 
             // run the command
             childProcess(commands);
@@ -372,7 +421,9 @@ void runCommannd(char commands[MAXARGS][ARGLENGTH], int backgroundChildren[MAXCH
 
                 break;
             }
-            else { // foreground command
+
+            // foreground command
+            else {
 
                 // blocks parent until child completes
                 waitpid(currentChildPID, &exitMethod, 0);
@@ -488,11 +539,11 @@ void redirectOutput(char *outputFile, int backgroundFlag) {
             dup2(outputID, 1);
         }
 
-        // file does not exist, open one write only
+        // file does not exist, create one
         else {
 
             // attempt to create and open a new file
-            outputID = open(outputFile, O_WRONLY | O_CREAT);
+            outputID = open(outputFile, O_RDWR | O_CREAT, 0666);
             
             // open successful, redirect stdout to file
             if (outputID != -1) {
@@ -588,7 +639,10 @@ void copyExecArgs(char commands[MAXARGS][ARGLENGTH], char **temp) {
         else if (strstr(commands[i], "$$")) {
 
             // expand $$ into PID of the shell
-            expandPID(commands[i], temp[j]);
+            expandPID(commands[i], getppid());
+
+            // copy command into temp
+            strcpy(temp[j], commands[i]);
 
             i++;
             j++;
@@ -610,13 +664,15 @@ void copyExecArgs(char commands[MAXARGS][ARGLENGTH], char **temp) {
 
 }
 
-void expandPID(char* currentCommand, char* destination) {
+void expandPID(char* currentCommand, int pid) {
 
     /* Variable Declarations */
-    int i = 0;                      // counter for current command   
-    int j = 0;                      // counter for destination
-    int x;                          // counter for PID
-    char temp[8] = { '\0' };        // temp array for PID
+    int i = 0;                              // counter for current command   
+    int j = 0;                              // counter for destination
+    int x;                                  // counter for PID
+    char tempPID[8] = { '\0' };             // temp array for PID
+    char tempCommand[ARGLENGTH] = { '\0' }; // temp array for expanded command
+
 
     // run while there is still part of the current command to copy
     while (currentCommand[i]) {
@@ -625,12 +681,12 @@ void expandPID(char* currentCommand, char* destination) {
         if (currentCommand[i] == '$' && currentCommand[i+1] == '$') {
 
             // copy the PID into temp
-            sprintf(temp, "%d", getppid());
+            sprintf(tempPID, "%d", pid);
 
             // copy pid into destination
             x = 0;
-            while (temp[x]) {
-                destination[j] = temp[x];
+            while (tempPID[x]) {
+                tempCommand[j] = tempPID[x];
                 j++;
                 x++;
             }
@@ -641,11 +697,13 @@ void expandPID(char* currentCommand, char* destination) {
 
         // otherwise copy character
         else {
-            destination[j] = currentCommand[i];
+            tempCommand[j] = currentCommand[i];
             i++;
             j++;
         }
     }
+
+    strcpy(currentCommand, tempCommand);
 }
 
 void freeExecArgs(char ** commands) {
@@ -694,5 +752,81 @@ void collectData(int exitMethod, int statusInfo[2]) {
         statusInfo[1] = 1;
         statusInfo[1] = WTERMSIG(exitMethod);
     }
+
+}
+
+
+
+
+/***************** SIGNALS ***********************/
+void killSIGINT() {
+
+    int pid = getpid();
+
+    write(STDOUT_FILENO, "TESTING: ", 9);
+    write(STDOUT_FILENO, &pid, sizeof(pid));
+    write(STDOUT_FILENO, "\n: ", 1);
+}
+
+void ignoreSIGINT(struct sigaction *SIGINT_action) {
+
+    SIGINT_action->sa_handler = SIG_IGN;
+    sigfillset(&SIGINT_action->sa_mask);
+    SIGINT_action->sa_flags = 0;
+
+    sigaction(SIGINT, SIGINT_action, NULL);    // register the action to the SIGINT signal
+
+}
+
+void processSIGINT(struct sigaction *SIGINT_action) {
+
+    // need to pass child pid into function handler
+
+    SIGINT_action->sa_handler = killSIGINT;
+    sigfillset(&SIGINT_action->sa_mask);
+    SIGINT_action->sa_flags = 0;
+
+    sigaction(SIGINT, SIGINT_action, NULL);    // register the action to the SIGINT signal
+
+}
+
+void assignChildSignal(struct sigaction *SIGINT_action, int backgroundFlag) {
+
+    // background children ignore SIGINT
+    if (backgroundFlag) {
+        ignoreSIGINT(SIGINT_action);
+    }
+
+    // foregound children need to process SIGINT
+    else {
+        processSIGINT(SIGINT_action);
+    }
+
+}
+
+void processSIGTSTP() {
+
+    // flag currently enabled
+    if (BACKGROUND_ENABLED) {
+
+        // clear the flag and tell user
+        BACKGROUND_ENABLED = 0;
+        write(STDOUT_FILENO, "\nEntering foreground-only mode (& is now disabled)\n", 51);
+    }
+
+    // flag currently disabled
+    else {
+        BACKGROUND_ENABLED = 1;
+        write(STDOUT_FILENO, "\nExiting foreground-only mode (& is now enabled)\n", 49);
+    }    
+}
+
+void ignoreSIGTSTP(struct sigaction *SIGTSTP_action) {
+
+    SIGTSTP_action->sa_handler = processSIGTSTP;
+    sigfillset(&SIGTSTP_action->sa_mask);
+    SIGTSTP_action->sa_flags = 0;
+
+    sigaction(SIGTSTP, SIGTSTP_action, NULL);    // register the action to the SIGTSTP signal
 
 }
